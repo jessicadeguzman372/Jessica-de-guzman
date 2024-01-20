@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#/ Usage: ghe-ssh [<option>...] <host> [<simple-command>...]
+#/        echo 'set -o pipefail; <complex-command>...' | ghe-ssh [<option>...] <host> /bin/bash
+#/ Helper to ssh into a GitHub instance with the right user and port. The first
+#/ form should be used for simple commands; the second form should be used for
+#/ complex commands that include pipelines or multiple commands.
+set -e
+
+# Bring in the backup configuration
+# shellcheck source=share/github-backup-utils/ghe-backup-config
+. "$( dirname "${BASH_SOURCE[0]}" )/ghe-backup-config"
+
+opts="$GHE_EXTRA_SSH_OPTS"
+while true; do
+  case "$1" in
+    -p)
+      port="$2"
+      shift 2
+      ;;
+    -l)
+      user="$2"
+      shift 2
+      ;;
+    -n)
+      opts="$opts $1"
+      shift 1
+      ;;
+    -o)
+      opts="$opts $1 $2"
+      shift 2
+      ;;
+    -c|--clean)
+      cleanup_mux=1
+      break
+      ;;
+    --)
+      echo "Error: illegal '--' in ssh invocation"
+      exit 1
+      ;;
+    *)
+      host="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+if [ -n "$cleanup_mux" ]; then
+  find $TMPDIR -name ".ghe-sshmux-*" -type s -exec ssh -O stop -S {} - \; >/dev/null 2>&1 || true
+  exit
+fi
+
+# Show usage with no host
+[ -z "$host" ] && print_usage
+
+# Shift off '--' if given immediately after host.
+if [ "$1" = "--" ]; then
+  shift
+fi
+
+# Bail out with error if the simple command form is used with complex commands.
+# Complex
+if echo "$*" | grep "[|;]" >/dev/null || [ "$(echo "$*" | wc -l)" -gt 1 ]; then
+  echo "fatal: ghe-ssh: Attempt to invoke complex command with simple command form." 1>&2
+  echo "See ghe-ssh --help for more on correcting." 1>&2
+  exit 1
+fi
+
+# Split user@host:port into parts. The user and port are only used if not
+# specified earlier.
+user=${user:-$(ssh_user_part "$host")}
+port=${port:-$(ssh_port_part "$host")}
+host=$(ssh_host_part "$host")
+ssh_config_file=$(mktemp -t ".ghe-ssh-config-XXXXXX")
+
+echo "Host *" > $ssh_config_file
+echo "  User $user" >> $ssh_config_file
+echo "  Port $port" >> $ssh_config_file
+echo "  BatchMode yes" >> $ssh_config_file
+
+# Determine if a <role>-server-<uuid> host has been specified, and if so
+# generate the relevant SSH configuration.
+if [[ "$host" =~ [A-Za-z]+-server-[A-Za-z0-9]{8}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{12} ]]; then
+  # Allow GIT_CONFIG to be specified manually for CI.
+  if [ -z "$GIT_CONFIG" ]; then
+    # If an individual backup step is being run directly, or this is a restore
+    # then ghe-backup-settings won't have ran, which transfers cluster.conf.
+    if ! $GHE_RESTORE_SNAPSHOT_PATH && [ -f "$GHE_SNAPSHOT_DIR/cluster.conf" ]; then
+      GIT_CONFIG="$GHE_SNAPSHOT_DIR/cluster.conf"
+    else
+      cluster_config_file="$(mktemp -t ".ghe-cluster-conf-XXXXXX")"
+      ghe-ssh -n "$GHE_HOSTNAME" -- "sudo cat $GHE_REMOTE_CLUSTER_CONF_FILE 2>/dev/null" > "$cluster_config_file"
+      GIT_CONFIG="$cluster_config_file"
+    fi
+  fi
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG
+
+  for cluster_host in $(git config --get-regexp cluster.*.hostname | cut -d ' ' -f2); do
+    uuid=$(git config cluster.$cluster_host.uuid)
+    if [ -n "$(git config cluster.$cluster_host.ipv6)" ]; then
+      ip=$(git config "cluster.$cluster_host.ipv6")
+    elif [ -n "$(git config cluster.$cluster_host.ipv4)" ]; then
+      ip=$(git config "cluster.$cluster_host.ipv4")
+    fi
+
+    echo "Host git-server-$uuid pages-server-$uuid storage-server-$uuid" >> $ssh_config_file
+    echo "  HostName $ip" >> $ssh_config_file
+    echo "  Port $port" >> $ssh_config_file
+    echo "  StrictHostKeyChecking no" >> $ssh_config_file
+    if [ "$GHE_SSH_DIRECT" != "yes" ]; then
+      echo "  ProxyCommand ghe-ssh \"$GHE_HOSTNAME\" -- nc.openbsd %h %p" >> $ssh_config_file
+    fi
+  done
+fi
+
+# Enable SSH multiplexing by default
+if [ -z "$GHE_DISABLE_SSH_MUX" ]; then
+  ssh_hostname=$(ssh -G -T $opts "$host" | grep "^hostname" | awk '{print $2}')
+  controlpath="$TMPDIR/.ghe-sshmux-$(echo -n "$user@$ssh_hostname:$port" | git hash-object --stdin | cut -c 1-8)"
+  # shellcheck disable=SC2089 # We don't use bash arrays
+  opts="-o ControlMaster=auto -o ControlPath=\"$controlpath\" -o ControlPersist=10m -o ServerAliveInterval=10 $opts"
+  # Workaround for https://bugzilla.mindrot.org/show_bug.cgi?id=1988
+  if ! [ -S $controlpath ]; then
+    # shellcheck disable=SC2090 # We don't need the quote/backslashes respected
+    ( cd "$TMPDIR" && ssh $opts -f -F $ssh_config_file "$host" -- /bin/true >/dev/null 2>&1 || true )
+  fi
+fi
+
+# Turn on verbose SSH logging if needed
+$GHE_VERBOSE_SSH && set -x
+
+# Exec ssh command with modified host / port args and add nice to command.
+# shellcheck disable=SC2090 # We don't need the quote/backslashes respected
+exec ssh $opts -F $ssh_config_file "$host" -- $GHE_NICE $GHE_IONICE "$@"
+
+# Cleanup temporary files
+rm $ssh_config_file $cluster_config_file
